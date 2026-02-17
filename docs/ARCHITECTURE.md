@@ -609,20 +609,20 @@ erDiagram
         string subject
         string message_body
         string message_body_redacted
-        map pii_mapping
+        string pii_mapping
         string classification
         string draft_response
-        number confidence
+        float confidence
         string task_token
         string response_text
         string approved_by
         string reviewed_by
-        number ttl
+        int ttl
     }
 
     CONVERSATION_STATE {
         string ticket_id PK
-        number turn_number SK
+        int turn_number SK
         string role
         string content
         string timestamp
@@ -632,9 +632,9 @@ erDiagram
         string customer_id PK
         string customer_email
         string name
-        list policy_numbers
+        string policy_numbers
         string preferred_channel
-        number interaction_count
+        int interaction_count
     }
 
     TICKETS ||--o{ CONVERSATION_STATE : "has turns"
