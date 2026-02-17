@@ -598,47 +598,61 @@ graph TB
 
 ## 11. DynamoDB Schema Design
 
+### Table Schemas
+
+#### **Tickets Table**
+
+| Attribute               | Type   | Key    | Description                                                                               |
+| ----------------------- | ------ | ------ | ----------------------------------------------------------------------------------------- |
+| `ticket_id`             | String | **PK** | UUID, unique ticket identifier                                                            |
+| `customer_id`           | String | —      | Foreign key to CustomerProfiles                                                           |
+| `channel`               | String | —      | `email` \| `whatsapp` \| `chat`                                                           |
+| `status`                | String | —      | `received` \| `processing` \| `awaiting_review` \| `approved` \| `rejected` \| `resolved` |
+| `timestamp`             | String | —      | ISO 8601 timestamp                                                                        |
+| `subject`               | String | —      | Email subject or chat title                                                               |
+| `message_body`          | String | —      | Original message (encrypted)                                                              |
+| `message_body_redacted` | String | —      | PII-safe version for LLM                                                                  |
+| `pii_mapping`           | Map    | —      | JSON: `{"[SSN_0]": "123-45-6789"}`                                                        |
+| `classification`        | String | —      | Intent: `general_inquiry` \| `claim_status` \| `complaint`                                |
+| `draft_response`        | String | —      | AI-generated draft                                                                        |
+| `confidence`            | Number | —      | Classification confidence (0-1)                                                           |
+| `task_token`            | String | —      | Step Functions callback token                                                             |
+| `response_text`         | String | —      | Final approved response                                                                   |
+| `approved_by`           | String | —      | Cognito user ID (if HITL)                                                                 |
+| `reviewed_by`           | String | —      | Cognito user ID                                                                           |
+| `ttl`                   | Number | —      | DynamoDB TTL (90 days)                                                                    |
+
+#### **ConversationState Table**
+
+| Attribute     | Type   | Key    | Description                    |
+| ------------- | ------ | ------ | ------------------------------ |
+| `ticket_id`   | String | **PK** | Links to Tickets table         |
+| `turn_number` | Number | **SK** | Conversation turn (1, 2, 3...) |
+| `role`        | String | —      | `user` \| `assistant`          |
+| `content`     | String | —      | Message content                |
+| `timestamp`   | String | —      | ISO 8601 timestamp             |
+
+#### **CustomerProfiles Table**
+
+| Attribute           | Type   | Key    | Description                      |
+| ------------------- | ------ | ------ | -------------------------------- |
+| `customer_id`       | String | **PK** | UUID, unique customer identifier |
+| `customer_email`    | String | —      | Email address                    |
+| `name`              | String | —      | Customer full name               |
+| `policy_numbers`    | List   | —      | Array of policy IDs              |
+| `preferred_channel` | String | —      | `email` \| `whatsapp` \| `chat`  |
+| `interaction_count` | Number | —      | Total tickets created            |
+
+### Relationships
+
 ```mermaid
-erDiagram
-    TICKETS {
-        string ticket_id PK
-        string customer_id
-        string channel
-        string status
-        string timestamp
-        string subject
-        string message_body
-        string message_body_redacted
-        string pii_mapping
-        string classification
-        string draft_response
-        float confidence
-        string task_token
-        string response_text
-        string approved_by
-        string reviewed_by
-        int ttl
-    }
+graph LR
+    CUSTOMER["👤 CustomerProfiles<br/>(customer_id)"] -->|"1:N"| TICKETS["🎫 Tickets<br/>(ticket_id)"]
+    TICKETS -->|"1:N"| CONV["💬 ConversationState<br/>(ticket_id, turn_number)"]
 
-    CONVERSATION_STATE {
-        string ticket_id PK
-        int turn_number SK
-        string role
-        string content
-        string timestamp
-    }
-
-    CUSTOMER_PROFILES {
-        string customer_id PK
-        string customer_email
-        string name
-        string policy_numbers
-        string preferred_channel
-        int interaction_count
-    }
-
-    TICKETS ||--o{ CONVERSATION_STATE : "has turns"
-    CUSTOMER_PROFILES ||--o{ TICKETS : "creates"
+    style CUSTOMER fill:#E3F2FD,stroke:#1565C0
+    style TICKETS fill:#FFF3E0,stroke:#E65100
+    style CONV fill:#E8F5E9,stroke:#2E7D32
 ```
 
 ### Global Secondary Indexes
