@@ -7,17 +7,23 @@
 
 ## Table of Contents
 
-| #   | Section                                           | Questions                                 |
-| --- | ------------------------------------------------- | ----------------------------------------- |
-| 1   | [High-Level Design](#1-high-level-design)         | Architecture, components, trade-offs      |
-| 2   | [Data Modeling](#2-data-modeling)                 | DynamoDB, schema design, access patterns  |
-| 3   | [RAG & Search](#3-rag--vector-search)             | Embeddings, retrieval, relevance          |
-| 4   | [Security & PII](#4-security--pii-handling)       | Encryption, PII redaction, compliance     |
-| 5   | [Orchestration](#5-orchestration--step-functions) | Workflow, HITL, error handling            |
-| 6   | [Scalability](#6-scalability--performance)        | Throughput, latency, caching              |
-| 7   | [LLM & Guardrails](#7-llm--guardrails)            | Prompt engineering, safety, hallucination |
-| 8   | [Cost & Operations](#8-cost--operations)          | Optimization, monitoring, DR              |
-| 9   | [Deep Dive Scenarios](#9-deep-dive-scenarios)     | End-to-end walkthroughs                   |
+| #   | Section                                                          | Questions                                 |
+| --- | ---------------------------------------------------------------- | ----------------------------------------- |
+| 1   | [High-Level Design](#1-high-level-design)                        | Architecture, components, trade-offs      |
+| 2   | [Data Modeling](#2-data-modeling)                                | DynamoDB, schema design, access patterns  |
+| 3   | [RAG & Search](#3-rag--vector-search)                            | Embeddings, retrieval, relevance          |
+| 4   | [Security & PII](#4-security--pii-handling)                      | Encryption, PII redaction, compliance     |
+| 5   | [Orchestration](#5-orchestration--step-functions)                | Workflow, HITL, error handling            |
+| 6   | [Scalability](#6-scalability--performance)                       | Throughput, latency, caching              |
+| 7   | [LLM & Guardrails](#7-llm--guardrails)                           | Prompt engineering, safety, hallucination |
+| 8   | [Cost & Operations](#8-cost--operations)                         | Optimization, monitoring, DR              |
+| 9   | [Deep Dive Scenarios](#9-deep-dive-scenarios)                    | End-to-end walkthroughs                   |
+| 10  | [API Design & Contracts](#10-api-design--contracts)              | REST, idempotency, versioning             |
+| 11  | [Consistency & CAP Theorem](#11-consistency--cap-theorem)        | Eventual consistency, data integrity      |
+| 12  | [Infrastructure as Code](#12-infrastructure-as-code)             | CDK stacks, deployment, rollback          |
+| 13  | [Data Migration & Versioning](#13-data-migration--versioning)    | Schema evolution, zero-downtime           |
+| 14  | [System Evolution & Future](#14-system-evolution--future-design) | Multi-region, real-time, A/B testing      |
+| 15  | [Behavioral & Follow-ups](#15-behavioral--follow-up-questions)   | Why decisions, failures, team dynamics    |
 
 ---
 
@@ -672,3 +678,630 @@ AI: "Your vision deductible is $250."
 - PII redaction strategy (regulatory requirement, no shortcuts).
 - Defense-in-depth security (non-negotiable for insurance).
 - Strict RAG mode (safety > convenience).
+
+---
+
+## 10. API Design & Contracts
+
+### 🟢 Q26: How would you design the REST API for the webhook channel?
+
+**Answer:**
+
+```
+POST /v1/tickets
+Authorization: Bearer <API_KEY>
+Content-Type: application/json
+
+{
+  "channel": "whatsapp",
+  "customer_id": "CUST-12345",
+  "message": "What's my deductible for dental?",
+  "attachments": [],
+  "metadata": {
+    "phone_number": "+1-555-0123",
+    "session_id": "sess-abc-789"
+  }
+}
+
+Response (202 Accepted):
+{
+  "ticket_id": "TKT-uuid-here",
+  "status": "received",
+  "estimated_response_time_seconds": 10,
+  "tracking_url": "/v1/tickets/TKT-uuid-here/status"
+}
+```
+
+**Key design decisions:**
+
+1. **202 (Accepted), not 200 (OK)** — The ticket is accepted for processing, not yet completed. This communicates the asynchronous nature clearly.
+2. **Tracking URL** — Provides a polling endpoint for clients that want real-time status updates.
+3. **Channel-agnostic** — The same API accepts WhatsApp, web chat, and future channels. The `channel` field drives routing logic downstream.
+4. **Idempotency** — Clients can include an `Idempotency-Key` header to prevent duplicate ticket creation on retries.
+
+---
+
+### 🟡 Q27: How do you ensure API idempotency?
+
+**Answer:**
+
+**Problem:** If the client retries a `POST /v1/tickets` call (network timeout), we might create two tickets for the same message.
+
+**Solution — Idempotency key pattern:**
+
+```python
+def create_ticket(event):
+    idempotency_key = event["headers"].get("Idempotency-Key")
+
+    if idempotency_key:
+        existing = dynamodb.get_item(
+            TableName="idempotency-store",
+            Key={"idempotency_key": idempotency_key}
+        )
+        if existing:
+            return existing["response"]  # Return cached response
+
+    # Process normally
+    ticket = process_new_ticket(event)
+
+    if idempotency_key:
+        dynamodb.put_item(
+            TableName="idempotency-store",
+            Item={
+                "idempotency_key": idempotency_key,
+                "response": ticket,
+                "ttl": int(time.time()) + 86400  # 24h expiry
+            }
+        )
+    return ticket
+```
+
+**Why DynamoDB for idempotency:** Single-digit ms reads, auto-scaling, TTL for automatic cleanup. Redis (ElastiCache) would also work but adds another service to manage.
+
+---
+
+### 🟡 Q28: How would you version the API?
+
+**Answer:**
+
+| Strategy     | Example                               | Chosen? | Why                                   |
+| ------------ | ------------------------------------- | ------- | ------------------------------------- |
+| **URL path** | `/v1/tickets`, `/v2/tickets`          | ✅ Yes  | Simple, explicit, no client confusion |
+| Header       | `Accept: application/vnd.api.v2+json` | ❌      | Hidden, harder to debug               |
+| Query param  | `/tickets?version=2`                  | ❌      | Easy to forget, caching issues        |
+
+**Versioning strategy:**
+
+- **v1** — Current production API.
+- Breaking changes (field renames, removed endpoints) trigger **v2**.
+- Non-breaking changes (new optional fields, new endpoints) are added to **v1** without versioning.
+- **Sunset policy:** v1 deprecated 6 months after v2 launch, removed after 12 months.
+
+**API Gateway stages** make this easy — each version maps to a separate stage with its own Lambda integration.
+
+---
+
+### 🔴 Q29: How do you handle rate limiting and throttling?
+
+**Answer:**
+
+**Three-tier throttling:**
+
+| Tier                       | Mechanism               | Limit                    | Scope                        |
+| -------------------------- | ----------------------- | ------------------------ | ---------------------------- |
+| **L1: WAF**                | AWS WAF rate-based rule | 1000 req/min per IP      | Perimeter — blocks DDoS      |
+| **L2: API Gateway**        | Usage plan + API key    | 100 req/min per customer | Per-customer fairness        |
+| **L3: Lambda concurrency** | Reserved concurrency    | 100 concurrent           | Protects downstream services |
+
+**Throttle response:**
+
+```json
+HTTP 429 Too Many Requests
+{
+  "error": "RATE_LIMIT_EXCEEDED",
+  "retry_after_seconds": 30,
+  "message": "You've exceeded 100 requests per minute. Please retry after 30 seconds.",
+  "limit": 100,
+  "remaining": 0,
+  "reset_at": "2026-02-18T02:30:00Z"
+}
+```
+
+**Backpressure propagation:** If Bedrock returns 429, the Lambda doesn't fail — it routes the ticket to HITL with a note "AI processing deferred due to high load." The customer still gets a response.
+
+---
+
+## 11. Consistency & CAP Theorem
+
+### 🟡 Q30: Where does the CAP theorem apply in this system?
+
+**Answer:**
+
+```
+CAP Theorem: In a distributed system, you can only guarantee 2 of 3:
+  Consistency (C) — Every read gets the latest write
+  Availability (A) — Every request gets a response
+  Partition Tolerance (P) — System works despite network splits
+```
+
+**Our choices per component:**
+
+| Component                  | CAP Choice                       | Why                                                                                                              |
+| -------------------------- | -------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| **DynamoDB**               | AP (eventually consistent reads) | We use eventually consistent reads for cost. Status updates may lag ~1s — acceptable.                            |
+| **DynamoDB** (HITL writes) | CP (strongly consistent)         | Ticket approval MUST be strongly consistent. We use `ConsistentRead=True` for HITL operations.                   |
+| **OpenSearch**             | AP                               | Near-real-time indexing (~1s delay). A stale search result is fine — the response still goes through guardrails. |
+| **S3**                     | CP (read-after-write)            | Audit logs must be immediately readable after write. S3 provides read-after-write consistency.                   |
+| **Step Functions**         | CP                               | Exactly-once execution semantics. Cannot lose or duplicate state transitions.                                    |
+
+**Key insight:** We don't pick one CAP position for the entire system. Each component chooses based on its specific requirements. Ticket status can be eventually consistent, but HITL approval decisions must be strongly consistent.
+
+---
+
+### 🔴 Q31: How do you handle the case where DynamoDB and Step Functions disagree on ticket status?
+
+**Answer:**
+
+**Scenario:** Step Functions says the ticket is "completed," but DynamoDB still shows "awaiting_review" due to a failed update.
+
+**Root cause:** The `send_response` Lambda succeeded (sent email) but crashed before updating DynamoDB.
+
+**Solution — Saga pattern with compensation:**
+
+```python
+def send_response(ticket_id, response_text):
+    try:
+        # Step 1: Update DynamoDB first (can be rolled back)
+        dynamodb.update_item(
+            Key={"ticket_id": ticket_id},
+            UpdateExpression="SET #status = :s",
+            ExpressionAttributeValues={":s": "sending"}
+        )
+
+        # Step 2: Send email (cannot be rolled back)
+        ses.send_email(to=customer_email, body=response_text)
+
+        # Step 3: Final status update
+        dynamodb.update_item(
+            Key={"ticket_id": ticket_id},
+            UpdateExpression="SET #status = :s",
+            ExpressionAttributeValues={":s": "resolved"}
+        )
+    except Exception as e:
+        # Compensation: roll back DynamoDB status
+        dynamodb.update_item(
+            Key={"ticket_id": ticket_id},
+            UpdateExpression="SET #status = :s",
+            ExpressionAttributeValues={":s": "send_failed"}
+        )
+        raise
+```
+
+**Reconciliation job:** A scheduled Lambda runs every 15 minutes, queries Step Functions execution history, and reconciles any status mismatches in DynamoDB. This handles edge cases where even the compensation logic fails.
+
+---
+
+### 🟡 Q32: What's the difference between at-most-once, at-least-once, and exactly-once delivery in your system?
+
+**Answer:**
+
+| Component               | Delivery Guarantee         | Why                                                                                       |
+| ----------------------- | -------------------------- | ----------------------------------------------------------------------------------------- |
+| **SES → Lambda**        | At-least-once              | SES may deliver the same email twice. Lambda must be idempotent.                          |
+| **SQS → Lambda** (HITL) | At-least-once              | SQS may re-deliver if visibility timeout expires. Idempotent callback logic handles this. |
+| **Step Functions**      | Exactly-once               | Standard workflows guarantee each state executes exactly once.                            |
+| **DynamoDB writes**     | At-most-once (conditional) | Conditional writes prevent duplicate updates.                                             |
+
+**How we handle at-least-once delivery:**
+
+```python
+def email_handler(event):
+    message_id = event["Records"][0]["ses"]["mail"]["messageId"]
+
+    # Idempotency check
+    try:
+        dynamodb.put_item(
+            Item={"message_id": message_id, "ttl": now + 86400},
+            ConditionExpression="attribute_not_exists(message_id)"
+        )
+    except ConditionalCheckFailedException:
+        return {"status": "DUPLICATE_SKIPPED"}  # Already processed
+
+    # Process normally
+    create_ticket(event)
+```
+
+---
+
+## 12. Infrastructure as Code
+
+### 🟢 Q33: Why CDK over Terraform or CloudFormation YAML?
+
+**Answer:**
+
+| Factor          | CDK (Chosen)                      | Terraform              | CloudFormation YAML  |
+| --------------- | --------------------------------- | ---------------------- | -------------------- |
+| **Language**    | Python (same as app)              | HCL (new language)     | YAML/JSON (no logic) |
+| **Type safety** | Full IDE support, autocomplete    | Limited                | None                 |
+| **Abstraction** | L2/L3 constructs (smart defaults) | Modules (manual)       | No abstraction       |
+| **Testing**     | pytest + assertions               | Go tests               | Custom tooling       |
+| **Multi-cloud** | AWS only                          | Multi-cloud ✅         | AWS only             |
+| **State**       | CloudFormation (managed)          | tfstate (must manage!) | Managed              |
+
+**Why CDK wins for this project:**
+
+1. **Same language** — Python developers don't need to learn HCL. The infra code lives alongside application code.
+2. **L2 constructs** — `lambda_.Function()` automatically creates IAM roles, log groups, and CloudWatch alarms. In Terraform, that's 30+ lines of HCL.
+3. **No state file management** — Terraform's `.tfstate` is a common source of production incidents. CDK uses CloudFormation, which AWS manages.
+
+**When Terraform wins:** Multi-cloud projects or teams with existing Terraform expertise.
+
+---
+
+### 🟡 Q34: How do you handle CDK deployment rollbacks?
+
+**Answer:**
+
+**CloudFormation automatic rollback:**
+
+- If any resource in a stack fails to create/update, CloudFormation automatically rolls back ALL changes in that stack.
+- This is atomic — either all changes succeed or none do.
+
+**Stack dependency order prevents cascading failures:**
+
+```
+Deploy order:  NetworkStack → SecurityStack → StorageStack → ...
+Rollback:      If StorageStack fails → only StorageStack rolls back
+               NetworkStack and SecurityStack remain intact
+```
+
+**Blue-green deployment for Lambda:**
+
+- Each CDK deploy creates a new Lambda version.
+- API Gateway uses stage variables to point to the new version.
+- If errors spike, revert the stage variable to the previous version (< 1 min rollback).
+
+**Database migrations are the hard part:**
+
+- DynamoDB schema changes (new GSI) are non-destructive — old code still works.
+- We never remove attributes in production. Deprecate first, remove after 2 releases.
+
+---
+
+### 🔴 Q35: How do you test infrastructure code before deploying to production?
+
+**Answer:**
+
+**Four-stage testing pyramid:**
+
+| Stage           | Tool                        | What It Tests                    | Speed   |
+| --------------- | --------------------------- | -------------------------------- | ------- |
+| **Unit**        | pytest + CDK assertions     | Stack structure, resource config | < 10s   |
+| **Snapshot**    | CDK snapshot testing        | Detect unintended changes        | < 10s   |
+| **Integration** | `cdk deploy` to dev account | Real AWS resource creation       | ~15 min |
+| **E2E**         | Production canary           | Full pipeline with test ticket   | ~30s    |
+
+**Unit test example (CDK assertions):**
+
+```python
+def test_storage_stack_creates_encrypted_bucket():
+    app = cdk.App()
+    stack = StorageStack(app, "TestStorage", security_stack=mock_security)
+
+    template = Template.from_stack(stack)
+    template.has_resource_properties("AWS::S3::Bucket", {
+        "BucketEncryption": {
+            "ServerSideEncryptionConfiguration": [{
+                "ServerSideEncryptionByDefault": {
+                    "SSEAlgorithm": "aws:kms"
+                }
+            }]
+        }
+    })
+```
+
+**Snapshot testing catches drift:**
+
+```python
+def test_no_unintended_changes():
+    template = Template.from_stack(stack)
+    # Fails if anyone adds/removes resources without updating the snapshot
+    assert template.to_json() == snapshot
+```
+
+---
+
+## 13. Data Migration & Versioning
+
+### 🟡 Q36: How do you handle DynamoDB schema evolution without downtime?
+
+**Answer:**
+
+**DynamoDB is schemaless** — you can add new attributes to any item at any time without a migration.
+
+**Adding a new GSI (Global Secondary Index):**
+
+```
+Phase 1: Create GSI (backfill runs automatically)
+         → Old code works fine, new GSI is building
+Phase 2: Deploy new code that uses the GSI
+         → GSI is ready, new queries work
+Phase 3: Clean up (optional)
+         → Remove old query logic
+```
+
+**This is zero-downtime** because DynamoDB backfills the GSI asynchronously while continuing to serve reads and writes.
+
+**Removing an attribute (dangerous):**
+
+```
+Phase 1: Stop writing the attribute (new code)
+         → Old items still have it, new items don't
+Phase 2: Deploy code that handles both cases
+         → attribute = item.get("old_field", default_value)
+Phase 3: Backfill to remove old values (optional cleanup)
+```
+
+**Rule:** Never remove an attribute in the same release that stops reading it. Always deploy in two phases.
+
+---
+
+### 🔴 Q37: How would you migrate from OpenSearch Serverless to a different vector database?
+
+**Answer:**
+
+**Strategy: Strangler Fig pattern**
+
+```
+Phase 1: DUAL WRITE
+  ┌──────────┐     ┌──────────────┐
+  │ Indexing  │────▶│ OpenSearch    │ (primary, serving reads)
+  │ Pipeline  │────▶│ New VectorDB  │ (shadow, no reads yet)
+  └──────────┘     └──────────────┘
+
+Phase 2: DUAL READ (canary)
+  10% of queries → New VectorDB (compare results, log discrepancies)
+  90% of queries → OpenSearch (still primary)
+
+Phase 3: CUTOVER
+  100% queries → New VectorDB
+  OpenSearch → read-only (kept for rollback)
+
+Phase 4: DECOMMISSION
+  OpenSearch → deleted after 2 weeks of stable operation
+```
+
+**Key safeguard:** Phase 2 comparison logging catches any quality regression before cutover. If the new database returns worse results, we stop the migration.
+
+**Rollback plan:** At any phase, revert API Gateway routing to OpenSearch. The data is still there.
+
+---
+
+## 14. System Evolution & Future Design
+
+### 🟡 Q38: How would you add real-time chat (WebSocket) support?
+
+**Answer:**
+
+**Current:** Email-based, asynchronous. Response time: seconds to hours.
+
+**WebSocket addition:**
+
+```
+Customer Browser ←→ API Gateway WebSocket ←→ Lambda (connection manager)
+                                                    ↓
+                                              Step Functions (same pipeline)
+                                                    ↓
+                                              Lambda (streamer)
+                                                    ↓
+                                    API Gateway WebSocket ←→ Customer Browser
+```
+
+**Implementation changes:**
+
+1. **API Gateway WebSocket API** — New endpoint alongside REST API. Handles `$connect`, `$disconnect`, `$default` routes.
+2. **Connection store** — DynamoDB table mapping `connection_id → ticket_id`. Enables pushing responses back.
+3. **Bedrock streaming** — Instead of waiting for the full response, stream tokens to the WebSocket as Claude generates them.
+4. **Guardrails adaptation** — Run input guardrails (L1-L2) before LLM call. Run output guardrails (L3-L5) on the complete response before displaying the last chunk.
+
+**What stays the same:** PII redaction, RAG retrieval, HITL routing, audit logging — the pipeline is channel-agnostic.
+
+---
+
+### 🔴 Q39: How would you deploy this system across multiple AWS regions?
+
+**Answer:**
+
+**Motivation:** Disaster recovery, latency reduction for global customers, regulatory data residency.
+
+| Component          | Multi-Region Strategy           | Complexity                  |
+| ------------------ | ------------------------------- | --------------------------- |
+| **DynamoDB**       | Global Tables (active-active)   | Low — built-in              |
+| **S3**             | Cross-Region Replication (CRR)  | Low — built-in              |
+| **OpenSearch**     | Independent clusters per region | High — re-index             |
+| **Lambda**         | Deploy same code to each region | Medium — CDK multi-region   |
+| **Step Functions** | Independent per region          | Medium — same state machine |
+| **Bedrock**        | Region-specific endpoints       | Low — change endpoint       |
+| **KMS**            | Multi-region keys               | Medium — key replication    |
+
+**Routing:** Route 53 latency-based routing sends customers to the nearest region.
+
+**Challenge: Data consistency across regions.**
+
+- DynamoDB Global Tables provide eventual consistency (~1s replication lag).
+- A customer emailing from EU could have their ticket processed in eu-west-1, but a HITL reviewer in us-east-1 might see a 1s delay.
+- Acceptable trade-off for our use case. Insurance ticket review is not latency-sensitive at the sub-second level.
+
+---
+
+### 🟡 Q40: How would you implement A/B testing for different LLM models?
+
+**Answer:**
+
+**Goal:** Test whether Claude Haiku gives acceptable quality for general inquiries (at 10x lower cost).
+
+**Implementation:**
+
+```python
+def select_model(intent: str, confidence: float) -> str:
+    # Feature flag from AWS AppConfig
+    experiment = appconfig.get_feature_flag("llm_ab_test")
+
+    if not experiment["enabled"]:
+        return "claude-4.6-sonnet"
+
+    # Only test on safe intents
+    if intent != "general_inquiry" or confidence < 0.95:
+        return "claude-4.6-sonnet"  # Always use best model for risky tickets
+
+    # Random assignment
+    bucket = hash(ticket_id) % 100
+    if bucket < experiment["treatment_percent"]:  # e.g., 20%
+        return "claude-haiku"
+    return "claude-4.6-sonnet"
+```
+
+**Metrics to compare:**
+
+- HITL override rate (did humans reject the Haiku response more often?)
+- Guardrail violation rate
+- Customer satisfaction (follow-up email sentiment)
+- Cost per ticket
+
+**Safety:** A/B test only on `general_inquiry` with high confidence. Claims and complaints always use the best model.
+
+---
+
+### 🔴 Q41: How would you add a feedback loop to improve model performance over time?
+
+**Answer:**
+
+```mermaid
+flowchart LR
+    HITL["HITL Decision<br/>(approve/edit/reject)"] --> LOG["Feedback Logger<br/>(S3)"]
+    LOG --> AGG["Weekly Aggregator<br/>(Glue Job)"]
+    AGG --> DATASET["Training Dataset<br/>(S3)"]
+    DATASET --> FINETUNE["SageMaker<br/>Fine-tuning"]
+    FINETUNE --> EVAL["Evaluation<br/>(held-out set)"]
+    EVAL -->|"Better"| DEPLOY["Deploy to Bedrock<br/>(Custom Model)"]
+    EVAL -->|"Worse"| DISCARD["Discard & Investigate"]
+
+    style HITL fill:#FFF3E0,stroke:#E65100
+    style DEPLOY fill:#E8F5E9,stroke:#2E7D32
+    style DISCARD fill:#FFCDD2,stroke:#B71C1C
+```
+
+**Data collected at each HITL review:**
+
+| Field            | Value               | Use                          |
+| ---------------- | ------------------- | ---------------------------- |
+| `original_draft` | AI response         | Negative example if rejected |
+| `edited_draft`   | Human edit          | Positive example (preferred) |
+| `action`         | approve/edit/reject | Label for training           |
+| `edit_diff`      | What changed        | Fine-grained feedback        |
+| `intent`         | Classification      | Segment by category          |
+
+**Training approach:** Direct Preference Optimization (DPO) using pairs of (AI draft, human-edited draft) to teach the model what "good" insurance responses look like.
+
+**Guardrail:** Never auto-deploy a fine-tuned model. Always evaluate on a held-out test set and require manual approval from the ML team.
+
+---
+
+## 15. Behavioral & Follow-up Questions
+
+### 🟡 Q42: What was the hardest technical decision in this project?
+
+**Answer:**
+
+**Strict RAG mode vs. Permissive RAG mode.**
+
+**The debate:**
+
+- **Permissive:** Always generate a response, even with low-confidence retrieval. Tag it as "low confidence" for HITL review.
+- **Strict (chosen):** If no chunks score ≥ 0.7, refuse to generate and route directly to HITL.
+
+**Why strict won:**
+
+- In insurance, a "best effort" response that's wrong is worse than no response.
+- Permissive mode generates more HITL work (reviewers must check every low-confidence draft).
+- Strict mode produces higher-quality auto-approved responses because the LLM only works with relevant context.
+- The customer experience is "a specialist will respond shortly" vs. a potentially wrong answer.
+
+**What I learned:** In regulated industries, saying "I don't know" is a feature, not a bug. The system's value isn't in answering every question — it's in answering correctly or escalating appropriately.
+
+---
+
+### 🟡 Q43: How do you handle a production incident where the guardrails miss a payout promise?
+
+**Answer:**
+
+**Incident response plan (4 phases):**
+
+| Phase                | Action                                                                       | Timeline |
+| -------------------- | ---------------------------------------------------------------------------- | -------- |
+| **1. Detect**        | CloudWatch alarm on customer complaint or manual report                      | Minutes  |
+| **2. Contain**       | Disable auto-approve globally (feature flag) → all tickets go to HITL        | < 5 min  |
+| **3. Investigate**   | Review: What pattern did Layer 3 miss? Why did the regex/keyword check fail? | Hours    |
+| **4. Fix & Prevent** | Add the new pattern to guardrails, add test case, post-mortem                | 1-2 days |
+
+**Immediate containment:**
+
+```python
+# AWS AppConfig feature flag
+AUTO_APPROVE_ENABLED = appconfig.get_flag("auto_approve_enabled")
+# Set to False → every ticket goes to HITL
+```
+
+**Post-mortem template:**
+
+1. What happened? (The AI said "your claim for $5000 is approved")
+2. Why did guardrails miss it? (New payout phrase not in the keyword list)
+3. What's the fix? (Add pattern, add test, tighten regex)
+4. What's the systemic improvement? (Weekly review of auto-approved responses for new payout patterns)
+
+---
+
+### 🟡 Q44: How would you explain this architecture to a non-technical stakeholder?
+
+**Answer:**
+
+> "Think of it like a really smart mail clerk who reads every customer email, understands what they're asking, looks up the answer in our policy handbook, writes a draft response, and then — depending on how sensitive the topic is — either sends it automatically or puts it on a reviewer's desk for approval.
+>
+> The key difference from a regular chatbot: **it never makes up answers.** It only uses information from our actual policy documents. And for anything involving money — claims, refunds, complaints — a human always reviews it before the customer sees it.
+>
+> It can handle about 1,000 emails per hour, costs about $25 per day to run, and reduces response time from 4-8 hours to under 10 seconds for routine questions."
+
+**Three things stakeholders care about:**
+
+1. **Risk:** "Humans always review financial decisions." ✅
+2. **Cost:** "$740/month vs. $15,000/month for 3 additional support agents." ✅
+3. **Speed:** "10 seconds vs. 4-8 hours for routine questions." ✅
+
+---
+
+### 🔴 Q45: What metrics would you track to prove this system is working?
+
+**Answer:**
+
+**Business metrics (stakeholder dashboard):**
+
+| Metric                    | Baseline (Manual)  | Target (AI+HITL)           | How Measured                         |
+| ------------------------- | ------------------ | -------------------------- | ------------------------------------ |
+| **Avg. response time**    | 4-8 hours          | < 10s (auto) / < 2h (HITL) | DynamoDB timestamp diff              |
+| **Cost per ticket**       | ~$5 (agent salary) | ~$0.03 (auto) / ~$3 (HITL) | Bedrock + Lambda cost / ticket count |
+| **Customer satisfaction** | 3.2/5              | > 4.0/5                    | Post-resolution survey               |
+| **Accuracy**              | 92%                | > 95%                      | HITL rejection rate (inverse)        |
+| **Compliance incidents**  | 2/month            | 0/month                    | Audit log review                     |
+
+**Operational metrics (engineering dashboard):**
+
+| Metric                   | Alert Threshold         | Measured By                |
+| ------------------------ | ----------------------- | -------------------------- |
+| Auto-approve rate        | < 40% (too many HITL)   | Step Functions metrics     |
+| Guardrail violation rate | > 15% (model degrading) | Custom CloudWatch metric   |
+| HITL review time (p95)   | > 4 hours               | DynamoDB timestamp diff    |
+| DLQ depth                | > 0                     | SQS CloudWatch metric      |
+| Bedrock latency (p99)    | > 15 seconds            | CloudWatch Bedrock metrics |
+| Lambda error rate        | > 5%                    | CloudWatch Lambda metrics  |
+
+**The golden metric:** Auto-approve rate. If it drops, either the model is degrading, the guardrails are too strict, or the query distribution has shifted. This single number captures system health.
