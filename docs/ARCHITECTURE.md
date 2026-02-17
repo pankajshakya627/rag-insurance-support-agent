@@ -6,7 +6,7 @@
 
 ## 1. High-Level System Architecture
 
-![Insurance AI System Architecture](/Volumes/CrucialX9_MAC/github_repos/RAG_Insurance/docs/system_architecture.png)
+![Insurance AI System Architecture](system_architecture.svg)
 
 ```mermaid
 graph TB
