@@ -1,12 +1,95 @@
 # Insurance Customer Support AI Agent — System Design Architecture
 
-> **Version:** 1.0 &nbsp;|&nbsp; **Last Updated:** 2026-02-18 &nbsp;|&nbsp; **Status:** Production-Ready Design
+> **Version:** 2.0 &nbsp;|&nbsp; **Last Updated:** 2026-02-18 &nbsp;|&nbsp; **Status:** Production-Ready Design
 
 ---
 
-## 1. High-Level System Architecture
+## Table of Contents
+
+| #   | Section                                                                             | Focus                                |
+| --- | ----------------------------------------------------------------------------------- | ------------------------------------ |
+| 1   | [Executive Summary](#1-executive-summary)                                           | Problem, solution, key metrics       |
+| 2   | [Design Principles](#2-design-principles)                                           | Architectural decisions & trade-offs |
+| 3   | [High-Level System Architecture](#3-high-level-system-architecture)                 | End-to-end pipeline overview         |
+| 4   | [AWS Service Topology](#4-aws-service-topology)                                     | VPC, subnets, endpoints              |
+| 5   | [Step Functions Orchestration](#5-step-functions-state-machine--orchestration-flow) | State machine + error handling       |
+| 6   | [Data Flow Pipeline](#6-data-flow--transformation-pipeline)                         | 8-stage transformation lifecycle     |
+| 7   | [Security Architecture](#7-security-architecture)                                   | 5-layer defense-in-depth             |
+| 8   | [HITL Review Workflow](#8-hitl-review-workflow)                                     | Human review sequence diagram        |
+| 9   | [RAG Pipeline](#9-rag-pipeline--knowledge-retrieval)                                | Indexing + query pipeline            |
+| 10  | [Guardrails Stack](#10-guardrails--5-layer-validation-stack)                        | Content safety validation            |
+| 11  | [DynamoDB Schema](#11-dynamodb-schema-design)                                       | Tables, GSIs, ER diagram             |
+| 12  | [CDK Deployment](#12-deployment-architecture-cdk-stacks)                            | 7 stacks + dependency graph          |
+| 13  | [Error Handling & Resilience](#13-error-handling--resilience)                       | DLQ, retries, circuit breakers       |
+| 14  | [Capacity Planning](#14-capacity-planning)                                          | Throughput, limits, scaling          |
+| 15  | [Cost Optimization](#15-cost-optimization-strategy)                                 | Service-level savings                |
+| 16  | [Non-Functional Requirements](#16-non-functional-requirements)                      | SLAs and targets                     |
+| 17  | [Disaster Recovery](#17-disaster-recovery--business-continuity)                     | RPO/RTO, backup strategy             |
+| 18  | [Component Matrix](#18-component-interaction-matrix)                                | Reads/writes per component           |
+
+---
+
+## 1. Executive Summary
+
+### Problem Statement
+
+Insurance customer support teams handle **thousands of emails daily** covering claims, billing, policy questions, and complaints. Manual triage and response is slow (avg. 4-8 hours), error-prone, and lacks compliance consistency.
+
+### Solution
+
+An AI-powered agent that **automatically triages, classifies, and drafts responses** using Retrieval-Augmented Generation (RAG) grounded in actual policy documents — with mandatory human review for sensitive categories and a 5-layer guardrail stack to prevent hallucination, payout promises, and off-topic responses.
+
+### Key Design Metrics
+
+| Metric            | Target                      | How Achieved                          |
+| ----------------- | --------------------------- | ------------------------------------- |
+| **Response Time** | < 10s (auto-approve)        | Lambda warm starts, Bedrock streaming |
+| **Accuracy**      | > 95% grounded in docs      | Strict RAG mode (cosine ≥ 0.7)        |
+| **PII Exposure**  | Zero PII to LLM             | Comprehend + regex pre-processing     |
+| **HITL Coverage** | 100% for claims/complaints  | Intent-based routing rules            |
+| **Audit Trail**   | Immutable, 7-year retention | S3 Object Lock + lifecycle            |
+
+---
+
+## 2. Design Principles
+
+### Architectural Decisions
+
+| Decision          | Choice                             | Rationale                                          | Alternative Considered           |
+| ----------------- | ---------------------------------- | -------------------------------------------------- | -------------------------------- |
+| **Orchestration** | Step Functions (Standard)          | Native AWS, visual debugging, built-in retries     | SQS fan-out, custom orchestrator |
+| **LLM Provider**  | Amazon Bedrock (Claude 4.6 Sonnet) | No data leaves AWS, HIPAA eligible                 | OpenAI API, self-hosted LLM      |
+| **Vector Store**  | OpenSearch Serverless              | Scales to zero, native k-NN, VPC support           | Pinecone, pgvector, FAISS        |
+| **PII Detection** | Comprehend + SageMaker + Regex     | Defense-in-depth, catches domain-specific patterns | Comprehend only, Presidio        |
+| **HITL Pattern**  | SQS + Step Functions Callback      | Decoupled, timeout-aware, audit-friendly           | API polling, WebSocket           |
+| **IaC**           | AWS CDK (Python)                   | Type-safe, composable, same language as app        | Terraform, CloudFormation YAML   |
+
+### Key Trade-offs
+
+```mermaid
+quadrantChart
+    title Architecture Trade-offs
+    x-axis Low Complexity --> High Complexity
+    y-axis Low Safety --> High Safety
+    quadrant-1 Target Zone
+    quadrant-2 Over-engineered
+    quadrant-3 Risky
+    quadrant-4 Simple but Dangerous
+    "5-Layer Guardrails": [0.7, 0.9]
+    "Strict RAG Mode": [0.4, 0.85]
+    "PII Redaction": [0.5, 0.95]
+    "HITL for Claims": [0.6, 0.8]
+    "Auto-Approve General": [0.3, 0.6]
+    "Keyword Escalation": [0.2, 0.75]
+```
+
+---
+
+## 3. High-Level System Architecture
 
 ![Insurance AI System Architecture](system_architecture.svg)
+
+The system follows a **pipeline architecture** where each stage transforms the ticket data and adds enrichments. The pipeline is orchestrated by AWS Step Functions, ensuring exactly-once processing and comprehensive error handling.
 
 ```mermaid
 graph TB
@@ -39,7 +122,7 @@ graph TB
 
     subgraph LLM_LAYER["🧠 LLM Generation"]
         direction LR
-        GENERATOR["⚡ Claude 3.5 Sonnet<br/>(Bedrock)"]
+        GENERATOR["⚡ Claude 4.6 Sonnet<br/>(Bedrock)"]
         GUARDRAILS["🛡️ 5-Layer Guardrails<br/>(Validation Engine)"]
     end
 
@@ -90,7 +173,9 @@ graph TB
 
 ---
 
-## 2. AWS Service Topology
+## 4. AWS Service Topology
+
+All compute runs inside a **private VPC** with no direct internet access. AWS services are reached exclusively through **VPC Endpoints**, ensuring traffic never traverses the public internet.
 
 ```mermaid
 graph TB
@@ -164,7 +249,9 @@ graph TB
 
 ---
 
-## 3. Step Functions State Machine — Orchestration Flow
+## 5. Step Functions State Machine — Orchestration Flow
+
+The orchestration uses a **Standard** Step Functions workflow (not Express) to guarantee exactly-once execution and support the **Task Token callback pattern** for HITL reviews with up to 24-hour wait times.
 
 ```mermaid
 stateDiagram-v2
@@ -190,7 +277,7 @@ stateDiagram-v2
     RetrieveContext --> RetrievalFailed : ❌ Error
 
     GenerateResponse --> ValidateResponse : ✅ Draft Generated
-    GenerateResponse --> GenerationFailed : ❌ Error
+    GenerateResponse --> ValidateResponse : ⚠️ Insufficient Context (fallback template)
 
     ValidateResponse --> ApprovalDecision : ✅ Validated
     ValidateResponse --> ValidationFailed : ❌ Error
@@ -219,11 +306,26 @@ stateDiagram-v2
     SendFailed --> [*]
 ```
 
+### State Details
+
+| State              | Lambda                 | Timeout      | Retry            | DLQ on Failure |
+| ------------------ | ---------------------- | ------------ | ---------------- | -------------- |
+| ProcessAttachments | `attachment-processor` | 300s         | 2x (exponential) | ✅             |
+| RedactPII          | `pii-redactor`         | 60s          | 2x               | ✅             |
+| ClassifyIntent     | `intent-classifier`    | 30s          | 2x               | ✅             |
+| RetrieveContext    | `rag-retriever`        | 30s          | 1x               | ✅             |
+| GenerateResponse   | `response-generator`   | 60s          | 1x               | ✅             |
+| ValidateResponse   | `guardrails-validator` | 30s          | 1x               | ✅             |
+| HITLReview         | SQS Callback           | 86400s (24h) | —                | ✅ (timeout)   |
+| SendResponse       | `response-sender`      | 60s          | 2x               | ✅             |
+
 ---
 
-## 4. Data Flow & Transformation Pipeline
+## 6. Data Flow & Transformation Pipeline
 
-![Insurance AI Data Flow Pipeline](/Volumes/CrucialX9_MAC/github_repos/RAG_Insurance/docs/data_flow_pipeline.png)
+Each stage transforms the ticket payload, enriching it with new fields while preserving the original data for auditability.
+
+![Insurance AI Data Flow Pipeline](data_flow_pipeline.png)
 
 ```mermaid
 flowchart LR
@@ -273,9 +375,11 @@ flowchart LR
 
 ---
 
-## 5. Security Architecture
+## 7. Security Architecture
 
-![Multi-Layered Security Architecture](/Volumes/CrucialX9_MAC/github_repos/RAG_Insurance/docs/security_architecture.png)
+The system implements a **defense-in-depth** strategy with 5 concentric security layers, from perimeter to data-level protection.
+
+![Multi-Layered Security Architecture](security_architecture.png)
 
 ```mermaid
 graph TB
@@ -331,9 +435,26 @@ graph TB
     style MONITORING fill:#E1BEE7,stroke:#4A148C,stroke-width:2px
 ```
 
+### Security Controls Summary
+
+| Layer      | Control         | Implementation                            | Compliance                 |
+| ---------- | --------------- | ----------------------------------------- | -------------------------- |
+| Perimeter  | Rate limiting   | WAF rules: 1000 req/min                   | DDoS protection            |
+| Perimeter  | Domain auth     | SES DKIM + SPF verification               | Anti-spoofing              |
+| Identity   | MFA             | Cognito TOTP mandatory                    | SOC 2                      |
+| Identity   | Least privilege | Per-Lambda IAM roles (8 unique)           | Principle of least access  |
+| Encryption | At rest         | KMS CMK with annual rotation              | HIPAA, PCI-DSS             |
+| Encryption | In transit      | TLS 1.2+ enforced on all endpoints        | PCI-DSS                    |
+| Data       | PII handling    | Redact before LLM, restore after approval | GDPR, CCPA                 |
+| Data       | Audit           | S3 Object Lock (WORM), 7-year retention   | SOX, Insurance regulations |
+| Network    | Isolation       | Private subnets, 8 VPC endpoints          | Network segmentation       |
+| Monitoring | Detection       | CloudWatch alarms → SNS → PagerDuty       | Incident response          |
+
 ---
 
-## 6. HITL Review Workflow
+## 8. HITL Review Workflow
+
+The HITL pattern uses the **Step Functions Task Token callback** mechanism. When a ticket requires human review, the state machine pauses and sends the task token to an SQS queue. The Streamlit dashboard polls the queue, presents the review card, and sends the callback to resume the pipeline.
 
 ```mermaid
 sequenceDiagram
@@ -377,9 +498,21 @@ sequenceDiagram
     SF->>DB: Update status = "resolved"
 ```
 
+### HITL Routing Rules
+
+| Condition                                               | Route                   | Rationale             |
+| ------------------------------------------------------- | ----------------------- | --------------------- |
+| Intent ∈ {`claim_status`, `claim_dispute`, `complaint`} | 🟡 HITL Review          | Financial/legal risk  |
+| Keywords: "lawyer", "fraud", "sue", "ombudsman"         | 🔴 Immediate Escalation | Legal trigger words   |
+| Guardrail violation (any layer)                         | 🟡 HITL Review          | Safety check failed   |
+| Confidence < 0.9                                        | 🟡 HITL Review          | Low model certainty   |
+| Intent = `general_inquiry` AND Confidence ≥ 0.9         | 🟢 Auto-Approve         | Safe, high confidence |
+
 ---
 
-## 7. RAG Pipeline — Knowledge Retrieval
+## 9. RAG Pipeline — Knowledge Retrieval
+
+The RAG pipeline operates in two modes: **Offline Indexing** (batch processing of policy documents) and **Online Query** (real-time retrieval during ticket processing). Strict mode ensures the system defers to a human when no sufficiently relevant documents exist, preventing hallucination.
 
 ```mermaid
 graph LR
@@ -418,9 +551,23 @@ graph LR
     style INDICES fill:#FFF3E0,stroke:#E65100,stroke-width:1px
 ```
 
+### RAG Configuration
+
+| Parameter            | Value           | Rationale                                 |
+| -------------------- | --------------- | ----------------------------------------- |
+| Embedding model      | Amazon Titan V2 | 1024-dim, multilingual, AWS-native        |
+| Chunk size           | 1000 characters | Fits in context window, preserves meaning |
+| Chunk overlap        | 200 characters  | Prevents boundary information loss        |
+| Top-k retrieval      | 5 chunks        | Balances context richness vs. noise       |
+| Similarity threshold | 0.7 (cosine)    | Strict mode — below this, defer to human  |
+| Index algorithm      | HNSW            | Sub-millisecond search at scale           |
+| Deduplication        | Content hash    | Prevents redundant context                |
+
 ---
 
-## 8. Guardrails — 5-Layer Validation Stack
+## 10. Guardrails — 5-Layer Validation Stack
+
+Every AI-generated response passes through **5 sequential validation layers** before reaching a customer. Any layer can block the response and route it to HITL review. This is the most critical safety mechanism in the system.
 
 ```mermaid
 graph TB
@@ -449,7 +596,7 @@ graph TB
 
 ---
 
-## 9. DynamoDB Schema Design
+## 11. DynamoDB Schema Design
 
 ```mermaid
 erDiagram
@@ -502,9 +649,19 @@ erDiagram
 | Tickets          | `customer-index` | `customer_id`    | `timestamp` | Customer history        |
 | CustomerProfiles | `email-index`    | `customer_email` | —           | Email → customer lookup |
 
+### Access Patterns
+
+| Access Pattern           | Table             | Key/Index                                      | Frequency           |
+| ------------------------ | ----------------- | ---------------------------------------------- | ------------------- |
+| Get ticket by ID         | Tickets           | PK = `ticket_id`                               | Per request         |
+| List pending reviews     | Tickets           | GSI `status-index`, status = `awaiting_review` | Dashboard poll (5s) |
+| Customer ticket history  | Tickets           | GSI `customer-index`                           | Per classification  |
+| Get conversation turns   | ConversationState | PK = `ticket_id`, SK = `turn_number`           | Per generation      |
+| Lookup customer by email | CustomerProfiles  | GSI `email-index`                              | Per ingestion       |
+
 ---
 
-## 10. Deployment Architecture (CDK Stacks)
+## 12. Deployment Architecture (CDK Stacks)
 
 ```mermaid
 graph BT
@@ -559,7 +716,71 @@ cdk deploy --all
 
 ---
 
-## 11. Cost Optimization Strategy
+## 13. Error Handling & Resilience
+
+### Retry Strategy
+
+```mermaid
+flowchart LR
+    INVOKE["Lambda Invoke"] -->|Fail| R1["Retry 1<br/>(2s backoff)"]
+    R1 -->|Fail| R2["Retry 2<br/>(4s backoff)"]
+    R2 -->|Fail| DLQ["Dead Letter Queue"]
+    DLQ --> ALARM["CloudWatch Alarm"]
+    ALARM --> SNS_NOTIFY["SNS → Ops Team"]
+    SNS_NOTIFY --> MANUAL["Manual Remediation"]
+
+    style DLQ fill:#FFCDD2,stroke:#B71C1C
+    style ALARM fill:#FFF9C4,stroke:#F57F17
+```
+
+### Failure Modes
+
+| Failure                | Detection                        | Recovery                         | Impact              |
+| ---------------------- | -------------------------------- | -------------------------------- | ------------------- |
+| Lambda timeout         | Step Functions catch             | Retry with exponential backoff   | Delayed response    |
+| Bedrock throttle       | HTTP 429                         | Retry after `Retry-After` header | Queued              |
+| OpenSearch unavailable | Connection timeout               | Fallback: "escalate to human"    | HITL routing        |
+| SES bounce             | Bounce notification              | Update ticket status, alert ops  | No delivery         |
+| HITL timeout (24h)     | Step Functions timeout           | Auto-escalate to admin group     | Escalation          |
+| PII detection miss     | Guardrails Layer 2 (Bedrock PII) | Bedrock API catches residual PII | Defense-in-depth    |
+| DynamoDB throttle      | ProvisionedThroughputExceeded    | On-Demand billing (auto-scale)   | None (auto-handled) |
+
+### Dead Letter Queue (DLQ)
+
+- **Queue**: `insurance-ai-dlq` (SQS FIFO)
+- **Retention**: 14 days
+- **Alarm**: CloudWatch alarm triggers when `ApproximateNumberOfMessagesVisible > 0`
+- **Action**: SNS notification → Ops team Slack channel
+
+---
+
+## 14. Capacity Planning
+
+### Throughput Estimates
+
+| Component                  | Limit                        | Actual Need        | Headroom |
+| -------------------------- | ---------------------------- | ------------------ | -------- |
+| Step Functions             | Unlimited state transitions  | 1000 executions/hr | ∞        |
+| Lambda concurrent          | 1000 (default, can increase) | ~100 concurrent    | 10x      |
+| Bedrock Claude             | 100 RPM (default)            | ~50 RPM            | 2x       |
+| Bedrock Titan (embeddings) | 1000 RPM                     | ~200 RPM           | 5x       |
+| OpenSearch Serverless      | Auto-scales (OCU-based)      | ~500 queries/hr    | Auto     |
+| DynamoDB On-Demand         | Auto-scales                  | ~3000 WCU/hr peak  | Auto     |
+| SES sending                | 200 emails/s (production)    | ~20 emails/s       | 10x      |
+
+### Scaling Triggers
+
+| Metric                    | Threshold        | Action                 |
+| ------------------------- | ---------------- | ---------------------- |
+| Lambda errors > 5%        | 5 min sustained  | Page on-call engineer  |
+| DLQ messages > 0          | Any message      | Immediate alert        |
+| HITL queue depth > 50     | 15 min sustained | Alert review team lead |
+| Bedrock latency p99 > 15s | 5 min sustained  | Check for throttling   |
+| OpenSearch OCU > 80%      | 10 min sustained | Auto-scales (verify)   |
+
+---
+
+## 15. Cost Optimization Strategy
 
 ```mermaid
 pie title Monthly Cost Distribution (Estimated)
@@ -583,32 +804,63 @@ pie title Monthly Cost Distribution (Estimated)
 
 ---
 
-## 12. Non-Functional Requirements
+## 16. Non-Functional Requirements
 
-| NFR                | Target                  | Implementation                              |
-| ------------------ | ----------------------- | ------------------------------------------- |
-| **Latency**        | < 10s for auto-response | Lambda warm starts; Bedrock streaming       |
-| **Throughput**     | 1000 tickets/hour       | Step Functions Standard (unlimited)         |
-| **Availability**   | 99.9%                   | Multi-AZ VPC; managed services SLAs         |
-| **Durability**     | 99.999999999%           | S3 11-9s; DynamoDB cross-region replication |
-| **Security**       | SOC 2 / HIPAA eligible  | KMS CMK; VPC isolation; audit logs          |
-| **HITL SLA**       | < 24h review time       | SQS 24h timeout; CloudWatch alarm           |
-| **PII Compliance** | Zero PII in LLM prompts | Comprehend + regex pre-processing           |
+| NFR                | Target                   | Implementation                              | Verification                 |
+| ------------------ | ------------------------ | ------------------------------------------- | ---------------------------- |
+| **Latency**        | < 10s for auto-response  | Lambda warm starts; Bedrock streaming       | CloudWatch p99 metric        |
+| **Throughput**     | 1000 tickets/hour        | Step Functions Standard (unlimited)         | Load test with Locust        |
+| **Availability**   | 99.9%                    | Multi-AZ VPC; managed services SLAs         | Composite SLA calculation    |
+| **Durability**     | 99.999999999%            | S3 11-9s; DynamoDB cross-region replication | AWS service guarantee        |
+| **Security**       | SOC 2 / HIPAA eligible   | KMS CMK; VPC isolation; audit logs          | Compliance audit checklist   |
+| **HITL SLA**       | < 24h review time        | SQS 24h timeout; CloudWatch alarm           | Queue depth monitoring       |
+| **PII Compliance** | Zero PII in LLM prompts  | Comprehend + regex pre-processing           | Unit test + integration test |
+| **Accuracy**       | > 95% grounded responses | Strict RAG (cosine ≥ 0.7)                   | Eval dataset + human review  |
 
 ---
 
-## 13. Component Interaction Matrix
+## 17. Disaster Recovery & Business Continuity
 
-| Component            | Reads From           | Writes To                | AWS Service         |
-| -------------------- | -------------------- | ------------------------ | ------------------- |
-| Email Handler        | SES                  | S3, DynamoDB, SNS        | Lambda              |
-| Webhook Handler      | API Gateway          | S3, DynamoDB, SNS        | Lambda              |
-| Attachment Processor | S3                   | DynamoDB                 | Lambda + Textract   |
-| PII Redactor         | DynamoDB             | DynamoDB                 | Lambda + Comprehend |
-| Intent Classifier    | DynamoDB             | DynamoDB                 | Lambda + Bedrock    |
-| RAG Retriever        | OpenSearch           | —                        | Lambda + Bedrock    |
-| Response Generator   | DynamoDB, OpenSearch | DynamoDB                 | Lambda + Bedrock    |
-| Guardrails Validator | —                    | DynamoDB                 | Lambda + Bedrock    |
-| HITL Callback        | SQS                  | DynamoDB, Step Functions | Lambda              |
-| Response Sender      | DynamoDB             | SES, S3, DynamoDB        | Lambda              |
-| Feedback Handler     | DynamoDB             | S3, SNS, DynamoDB        | Lambda              |
+### RPO / RTO Targets
+
+| Component          | RPO      | RTO      | Strategy                               |
+| ------------------ | -------- | -------- | -------------------------------------- |
+| **DynamoDB**       | 0 (PITR) | < 15 min | Point-in-Time Recovery enabled         |
+| **S3 Audit Logs**  | 0        | < 5 min  | Cross-region replication + Object Lock |
+| **OpenSearch**     | < 1 hr   | < 30 min | Automated snapshots, re-index from S3  |
+| **Step Functions** | N/A      | < 5 min  | Stateless re-deploy via CDK            |
+| **Lambda Code**    | N/A      | < 5 min  | CDK re-deploy from Git                 |
+| **KMS Keys**       | 0        | < 5 min  | Multi-region key replication           |
+
+### Backup Strategy
+
+```mermaid
+flowchart LR
+    DDB["DynamoDB<br/>PITR Enabled"] -->|Continuous| DDB_BACKUP["35-day<br/>Backup Window"]
+    S3["S3 Audit Logs"] -->|Cross-Region| S3_REPLICA["us-west-2<br/>Replica Bucket"]
+    OS["OpenSearch"] -->|Daily Snapshot| OS_SNAP["S3 Snapshot<br/>(7-day retention)"]
+    CDK["CDK Code"] -->|Git Push| GIT["GitHub<br/>Main Branch"]
+
+    style DDB_BACKUP fill:#E8F5E9,stroke:#2E7D32
+    style S3_REPLICA fill:#E3F2FD,stroke:#1565C0
+    style OS_SNAP fill:#FFF3E0,stroke:#E65100
+    style GIT fill:#F3E5F5,stroke:#6A1B9A
+```
+
+---
+
+## 18. Component Interaction Matrix
+
+| Component            | Reads From           | Writes To                | AWS Service         | IAM Permissions                                        |
+| -------------------- | -------------------- | ------------------------ | ------------------- | ------------------------------------------------------ |
+| Email Handler        | SES                  | S3, DynamoDB, SNS        | Lambda              | `ses:Receive`, `s3:Put`, `dynamodb:Put`, `sns:Publish` |
+| Webhook Handler      | API Gateway          | S3, DynamoDB, SNS        | Lambda              | `s3:Put`, `dynamodb:Put`, `sns:Publish`                |
+| Attachment Processor | S3                   | DynamoDB                 | Lambda + Textract   | `s3:Get`, `textract:Analyze`, `dynamodb:Update`        |
+| PII Redactor         | DynamoDB             | DynamoDB                 | Lambda + Comprehend | `comprehend:DetectPii`, `dynamodb:Get/Update`          |
+| Intent Classifier    | DynamoDB             | DynamoDB                 | Lambda + Bedrock    | `bedrock:InvokeModel`, `dynamodb:Get/Update`           |
+| RAG Retriever        | OpenSearch           | —                        | Lambda + Bedrock    | `bedrock:InvokeModel`, `aoss:APIAccessAll`             |
+| Response Generator   | DynamoDB, OpenSearch | DynamoDB                 | Lambda + Bedrock    | `bedrock:InvokeModel`, `dynamodb:Get/Update`           |
+| Guardrails Validator | —                    | DynamoDB                 | Lambda + Bedrock    | `bedrock:ApplyGuardrail`, `dynamodb:Update`            |
+| HITL Callback        | SQS                  | DynamoDB, Step Functions | Lambda              | `sqs:Receive`, `states:SendTask*`, `dynamodb:Update`   |
+| Response Sender      | DynamoDB             | SES, S3, DynamoDB        | Lambda              | `ses:Send`, `s3:Put`, `dynamodb:Update`, `kms:Decrypt` |
+| Feedback Handler     | DynamoDB             | S3, SNS, DynamoDB        | Lambda              | `s3:Put`, `sns:Publish`, `dynamodb:Update`             |
